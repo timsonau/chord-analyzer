@@ -56,3 +56,6 @@ dev-dist
 !.yarn/sdks
 !.yarn/versions
 .pnp.* 
+
+# AI related files
+.cursorrules
