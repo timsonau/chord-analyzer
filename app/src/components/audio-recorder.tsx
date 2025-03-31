@@ -1,21 +1,27 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
-import { Mic, Square, BarChart2, Info } from "lucide-react";
-import { detectPitches } from "@/lib/pitch-detection";
+import { Mic, Square, Info } from "lucide-react";
+import { detectPitch, PitchInfo } from "@/lib/pitch-detection";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 
+// Audio analysis configuration
+const AUDIO_CONFIG = {
+  MIN_VOLUME_THRESHOLD: 10, // Reduced from 20 for better sensitivity
+  HISTORY_SIZE: 5,
+  PITCH_DECAY_TIME: 800,
+  FFT_SIZE: 2048,
+  SMOOTHING_CONSTANT: 0.8,
+  PROCESSOR_BUFFER_SIZE: 4096
+} as const
+
 interface AudioRecorderProps {
-  setActiveNotes: (notes: string[]) => void;
-  setRootNote: (note: string | null) => void;
+  onPitchDetected: (pitch: PitchInfo | null) => void;
+  onVolumeChange: (volume: number) => void;
 }
 
-export function AudioRecorder({
-  setActiveNotes,
-  setRootNote,
-}: AudioRecorderProps) {
+export function AudioRecorder({ onPitchDetected, onVolumeChange }: AudioRecorderProps) {
   const [isRecording, setIsRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [volume, setVolume] = useState(0);
   const [debugInfo, setDebugInfo] = useState<Record<string, any>>({});
   const [showDebug, setShowDebug] = useState(false);
 
@@ -28,7 +34,11 @@ export function AudioRecorder({
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const processorNodeRef = useRef<ScriptProcessorNode | null>(null);
   const lastUpdateTimeRef = useRef<number>(0);
-  const detectedNotesRef = useRef<string[]>([]);
+
+  // Refs for pitch smoothing
+  const lastPitchRef = useRef<PitchInfo | null>(null);
+  const pitchHistoryRef = useRef<PitchInfo[]>([]);
+  const silenceStartRef = useRef<number | null>(null);
 
   // Debug function
   const updateDebugInfo = useCallback((info: Record<string, any>) => {
@@ -39,53 +49,43 @@ export function AudioRecorder({
   const initAudioContext = useCallback(async () => {
     try {
       if (!audioContextRef.current) {
-        console.log("Creating new AudioContext");
-        const AudioContextClass =
-          window.AudioContext || (window as any).webkitAudioContext;
-        if (!AudioContextClass) {
-          throw new Error("AudioContext not supported in this browser");
-        }
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext
+        if (!AudioContextClass) throw new Error("AudioContext not supported")
 
-        const context = new AudioContextClass();
-        audioContextRef.current = context;
+        const context = new AudioContextClass()
+        audioContextRef.current = context
 
-        // Create analyzer with smaller FFT size for better performance
-        const analyser = context.createAnalyser();
-        analyser.fftSize = 2048;
-        analyser.smoothingTimeConstant = 0.8;
-        analyserNodeRef.current = analyser;
+        const analyser = context.createAnalyser()
+        analyser.fftSize = AUDIO_CONFIG.FFT_SIZE
+        analyser.smoothingTimeConstant = AUDIO_CONFIG.SMOOTHING_CONSTANT
+        analyserNodeRef.current = analyser
 
-        // Also create a ScriptProcessor as fallback
-        const processor = context.createScriptProcessor(4096, 1, 1);
-        processorNodeRef.current = processor;
+        const processor = context.createScriptProcessor(AUDIO_CONFIG.PROCESSOR_BUFFER_SIZE, 1, 1)
+        processorNodeRef.current = processor
 
         updateDebugInfo({
           audioContextCreated: true,
           audioContextState: context.state,
           sampleRate: context.sampleRate,
           analyzerCreated: true,
-          fftSize: analyser.fftSize,
-        });
+          fftSize: analyser.fftSize
+        })
       }
 
-      // Make sure context is running
       if (audioContextRef.current.state === "suspended") {
-        await audioContextRef.current.resume();
-        updateDebugInfo({ audioContextState: audioContextRef.current.state });
+        await audioContextRef.current.resume()
+        updateDebugInfo({ audioContextState: audioContextRef.current.state })
       }
 
-      return true;
+      return true
     } catch (err) {
-      console.error("Audio context initialization error:", err);
-      setError(
-        `Could not initialize audio context: ${err instanceof Error ? err.message : "Unknown error"}`,
-      );
-      updateDebugInfo({
-        audioContextError: err instanceof Error ? err.message : String(err),
-      });
-      return false;
+      const errorMessage = err instanceof Error ? err.message : "Unknown error"
+      console.error("Audio context initialization error:", err)
+      setError(`Could not initialize audio context: ${errorMessage}`)
+      updateDebugInfo({ audioContextError: errorMessage })
+      return false
     }
-  }, [updateDebugInfo]);
+  }, [updateDebugInfo])
 
   // Clean up function
   const cleanupAudio = useCallback(() => {
@@ -127,8 +127,14 @@ export function AudioRecorder({
       updateDebugInfo({ animationCancelled: true });
     }
 
+    pitchHistoryRef.current = [];
+    lastPitchRef.current = null;
+    silenceStartRef.current = null;
+
     setIsRecording(false);
-  }, [updateDebugInfo]);
+    onPitchDetected(null);
+    onVolumeChange(0);
+  }, [updateDebugInfo, onPitchDetected, onVolumeChange]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -144,93 +150,96 @@ export function AudioRecorder({
   }, [cleanupAudio]);
 
   // Analyze audio function - separated from the animation loop
-  const analyzeAudio = useCallback(
-    (dataArray: Uint8Array, bufferLength: number) => {
-      // Calculate volume level
-      let sum = 0;
-      for (let i = 0; i < bufferLength; i++) {
-        sum += dataArray[i];
-      }
-      const avg = sum / bufferLength;
-      setVolume(avg / 256); // Normalize to 0-1
+  const analyzeAudio = useCallback((dataArray: Uint8Array, bufferLength: number) => {
+    const calculateVolume = (data: Uint8Array, length: number) => {
+      const sum = data.reduce((acc, val) => acc + val, 0)
+      return sum / length
+    }
 
-      updateDebugInfo({
-        volumeLevel: avg,
-        bufferLength,
-        timestamp: Date.now(),
-      });
+    const volume = calculateVolume(dataArray, bufferLength)
+    const normalizedVolume = Math.pow(volume / 256, 0.7) // Apply gamma correction for better sensitivity
+    onVolumeChange(normalizedVolume)
 
-      // Only detect notes when there's significant audio and not too frequently
-      const now = Date.now();
-      if (avg > 20 && now - lastUpdateTimeRef.current > 200) {
-        // Throttle to once every 200ms
-        try {
-          const detectedNotes = detectPitches(
-            dataArray,
-            analyserNodeRef.current?.fftSize || 2048,
-            audioContextRef.current?.sampleRate || 44100,
-          );
+    updateDebugInfo({
+      volumeLevel: volume,
+      normalizedVolume,
+      bufferLength,
+      timestamp: Date.now()
+    })
 
-          updateDebugInfo({
-            detectedNotes,
-            noteDetectionTime: now,
-            significantAudio: true,
-          });
+    const now = Date.now()
 
-          // Only update if notes have changed
-          if (
-            JSON.stringify(detectedNotes) !==
-            JSON.stringify(detectedNotesRef.current)
-          ) {
-            detectedNotesRef.current = detectedNotes;
-            setActiveNotes(detectedNotes);
+    // Detect pitch with increased sensitivity
+    if (volume > AUDIO_CONFIG.MIN_VOLUME_THRESHOLD) {
+      silenceStartRef.current = null
 
-            // Set the root note to the lowest note if we have notes
-            if (detectedNotes.length > 0) {
-              // Find the lowest note by comparing their positions in the chromatic scale
-              const allNotes = [
-                "C",
-                "C#",
-                "D",
-                "D#",
-                "E",
-                "F",
-                "F#",
-                "G",
-                "G#",
-                "A",
-                "A#",
-                "B",
-              ];
-              let lowestNote = detectedNotes[0];
-              let lowestIndex = allNotes.indexOf(lowestNote);
+      try {
+        const detectedPitch = detectPitch(
+          dataArray,
+          analyserNodeRef.current?.fftSize || AUDIO_CONFIG.FFT_SIZE,
+          audioContextRef.current?.sampleRate || 44100
+        )
 
-              for (let i = 1; i < detectedNotes.length; i++) {
-                const noteIndex = allNotes.indexOf(detectedNotes[i]);
-                if (noteIndex < lowestIndex) {
-                  lowestIndex = noteIndex;
-                  lowestNote = detectedNotes[i];
-                }
-              }
+        if (detectedPitch) {
+          pitchHistoryRef.current = [
+            ...pitchHistoryRef.current.slice(-(AUDIO_CONFIG.HISTORY_SIZE - 1)),
+            detectedPitch
+          ]
 
-              setRootNote(lowestNote);
-            } else {
-              setRootNote(null);
-            }
+          const shouldUpdatePitch = pitchHistoryRef.current.length >= 3 ||
+            !lastPitchRef.current ||
+            lastPitchRef.current.note !== detectedPitch.note
 
-            lastUpdateTimeRef.current = now;
+          if (shouldUpdatePitch) {
+            const avgPitch = calculateAveragePitch(pitchHistoryRef.current)
+            lastPitchRef.current = avgPitch
+            onPitchDetected(avgPitch)
           }
-        } catch (err) {
-          console.error("Error in note detection:", err);
-          updateDebugInfo({
-            noteDetectionError:
-              err instanceof Error ? err.message : String(err),
-          });
         }
+
+        updateDebugInfo({
+          pitch: detectedPitch,
+          pitchHistory: pitchHistoryRef.current.length,
+          pitchDetectionTime: now,
+          significantAudio: true
+        })
+
+        lastUpdateTimeRef.current = now
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : String(err)
+        console.error("Error in pitch detection:", err)
+        updateDebugInfo({ pitchDetectionError: errorMessage })
       }
-    },
-    [setActiveNotes, setRootNote, updateDebugInfo],
-  );
+    } else {
+      handleSilence(now)
+    }
+  }, [onPitchDetected, onVolumeChange, updateDebugInfo])
+
+  const calculateAveragePitch = (pitches: PitchInfo[]): PitchInfo => {
+    const avgFrequency = pitches.reduce((sum, p) => sum + p.frequency, 0) / pitches.length
+    const avgMagnitude = pitches.reduce((sum, p) => sum + p.magnitude, 0) / pitches.length
+    const lastPitch = pitches[pitches.length - 1]
+
+    const perfectFreq = lastPitch.frequency * Math.pow(2, -lastPitch.cents/1200)
+    const cents = Math.round(1200 * Math.log2(avgFrequency / perfectFreq))
+
+    return {
+      ...lastPitch,
+      frequency: avgFrequency,
+      magnitude: avgMagnitude,
+      cents
+    }
+  }
+
+  const handleSilence = (now: number) => {
+    if (!silenceStartRef.current) {
+      silenceStartRef.current = now
+    } else if (now - silenceStartRef.current > AUDIO_CONFIG.PITCH_DECAY_TIME) {
+      pitchHistoryRef.current = []
+      lastPitchRef.current = null
+      onPitchDetected(null)
+    }
+  }
 
   // Animation loop for visualization
   const startVisualization = useCallback(() => {
@@ -262,7 +271,7 @@ export function AudioRecorder({
         // Get frequency data
         analyser.getByteFrequencyData(dataArray);
 
-        // Analyze audio data (throttled inside)
+        // Analyze audio data
         analyzeAudio(dataArray, bufferLength);
 
         // Draw frequency spectrum
@@ -404,49 +413,7 @@ export function AudioRecorder({
   // Stop recording
   const stopRecording = () => {
     cleanupAudio();
-    setActiveNotes([]);
-    setRootNote(null);
   };
-
-  // Check browser capabilities on mount
-  useEffect(() => {
-    const checkCapabilities = async () => {
-      const audioContextSupported =
-        typeof AudioContext !== "undefined" ||
-        typeof (window as any).webkitAudioContext !== "undefined";
-
-      const userMediaSupported =
-        navigator.mediaDevices &&
-        typeof navigator.mediaDevices.getUserMedia !== "undefined";
-
-      const secureContext = window.isSecureContext;
-
-      let permissionState = "unknown";
-
-      if (navigator.permissions && navigator.permissions.query) {
-        try {
-          const result = await navigator.permissions.query({
-            name: "microphone" as PermissionName,
-          });
-          permissionState = result.state;
-        } catch (e) {
-          permissionState = "error checking";
-        }
-      }
-
-      updateDebugInfo({
-        browserCapabilities: {
-          audioContextSupported,
-          userMediaSupported,
-          secureContext,
-          permissionState,
-          userAgent: navigator.userAgent,
-        },
-      });
-    };
-
-    checkCapabilities();
-  }, [updateDebugInfo]);
 
   return (
     <div className="space-y-4">
@@ -460,7 +427,7 @@ export function AudioRecorder({
         <Button
           onClick={isRecording ? stopRecording : startRecording}
           variant={isRecording ? "destructive" : "default"}
-          className="gap-2"
+          className="gap-2 min-w-[160px] transition-all duration-300 hover:shadow-lg"
         >
           {isRecording ? (
             <>
@@ -475,27 +442,18 @@ export function AudioRecorder({
           )}
         </Button>
 
-        <div className="flex items-center gap-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setShowDebug(!showDebug)}
-            title="Toggle debug info"
-          >
-            <Info className="h-4 w-4" />
-          </Button>
-
-          <BarChart2 className="h-4 w-4" />
-          <div className="w-24 h-2 bg-muted rounded-full overflow-hidden">
-            <div
-              className="h-full bg-primary transition-all duration-100"
-              style={{ width: `${volume * 100}%` }}
-            />
-          </div>
-        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setShowDebug(!showDebug)}
+          title="Toggle debug info"
+          className="opacity-50 hover:opacity-100 transition-opacity"
+        >
+          <Info className="h-4 w-4" />
+        </Button>
       </div>
 
-      <div className="border rounded-md overflow-hidden bg-black">
+      <div className="border rounded-lg overflow-hidden bg-black/90 shadow-xl">
         <canvas
           ref={canvasRef}
           width={600}
@@ -504,15 +462,10 @@ export function AudioRecorder({
         />
       </div>
 
-      <div className="text-xs text-muted-foreground">
-        Play your instrument or chord into the microphone. The analyzer will
-        detect the notes and identify the chord.
-      </div>
-
       {showDebug && (
-        <div className="mt-4 p-3 bg-muted/20 rounded-md text-xs font-mono overflow-auto max-h-[200px]">
-          <h4 className="font-bold mb-2">Debug Info:</h4>
-          <pre>{JSON.stringify(debugInfo, null, 2)}</pre>
+        <div className="mt-4 p-4 bg-muted/10 rounded-lg text-xs font-mono overflow-auto max-h-[200px] border border-border/50">
+          <h4 className="font-medium mb-2 text-primary">Debug Info:</h4>
+          <pre className="opacity-80">{JSON.stringify(debugInfo, null, 2)}</pre>
         </div>
       )}
     </div>

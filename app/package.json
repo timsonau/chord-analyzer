@@ -1,7 +1,8 @@
 {
-  "name": "chord-detection-app",
+  "name": "pitch-detector",
   "private": true,
   "version": "0.1.0",
+  "description": "A professional-grade pitch detection application for musicians and vocalists, featuring real-time analysis and visual feedback",
   "type": "module",
   "scripts": {
     "dev": "vite",
