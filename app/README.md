@@ -18,18 +18,21 @@ A real-time chord detection application that analyzes audio input to identify mu
 ## Technical Details
 
 ### Audio Analysis
+
 - Uses Web Audio API's AnalyserNode for frequency analysis
 - Implements FFT (Fast Fourier Transform) for frequency detection
 - Filters out harmonics and noise for accurate note detection
 - Separate analyzers for visualization and note detection
 
 ### Chord Detection Algorithm
+
 - Identifies chord roots based on bass notes and strong beats
 - Matches note patterns against known chord voicings
 - Considers musical context and previous chord progressions
 - Weights important chord tones (3rds and 7ths) more heavily
 
 ### UI Components
+
 - Real-time frequency spectrum visualization
 - Note detection display with octave information
 - Chord matches with confidence percentages
@@ -58,6 +61,7 @@ A real-time chord detection application that analyzes audio input to identify mu
 ## Development
 
 The project uses:
+
 - Vite for development and building
 - TypeScript for type safety
 - Tailwind CSS for styling
@@ -74,4 +78,4 @@ The project uses:
 
 ## License
 
-MIT License - feel free to use this code for your own projects! 
+MIT License - feel free to use this code for your own projects!
